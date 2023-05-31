@@ -16,7 +16,7 @@ def log_variance_prior(log_variance: torch.Tensor, mean: float = 1e-6, variance:
 def weight_prior(parameters: Iterable[torch.Tensor], dtype=np.float64, wdecay: float = 1.) -> torch.Tensor:
 
     num_parameters = 0
-    log_likelihood = torch.from_numpy(np.array(0, dtype=dtype))
+    log_likelihood = 0.
     for parameter in parameters:
         num_parameters += parameter.numel()
         log_likelihood += torch.sum(-wdecay * 0.5 * (parameter ** 2))

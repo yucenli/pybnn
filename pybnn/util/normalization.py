@@ -1,14 +1,13 @@
-import numpy as np
-
+import torch
 
 def zero_one_normalization(X, lower=None, upper=None):
 
     if lower is None:
-        lower = np.min(X, axis=0)
+        lower = torch.min(X, axis=0)
     if upper is None:
-        upper = np.max(X, axis=0)
+        upper = torch.max(X, axis=0)
 
-    X_normalized = np.true_divide((X - lower), (upper - lower))
+    X_normalized = torch.true_divide((X - lower), (upper - lower))
 
     return X_normalized, lower, upper
 
@@ -19,9 +18,9 @@ def zero_one_denormalization(X_normalized, lower, upper):
 
 def zero_mean_unit_var_normalization(X, mean=None, std=None):
     if mean is None:
-        mean = np.mean(X, axis=0)
+        mean = torch.mean(X, axis=0)
     if std is None:
-        std = np.std(X, axis=0)
+        std = torch.std(X, axis=0)
 
     X_normalized = (X - mean) / std
 

@@ -45,8 +45,11 @@ def nll(input: torch.Tensor, target: torch.Tensor):
     """
     batch_size = input.size(0)
 
-    prediction_mean = input[:, 0].view((-1, 1))
-    log_prediction_variance = input[:, 1].view((-1, 1))
+    num_dims = int(input.shape[-1] / 2)
+    prediction_mean, log_prediction_variance = torch.split(input, [num_dims, num_dims], dim=-1)
+
+    prediction_mean = prediction_mean.reshape((-1, 1))
+    log_prediction_variance = log_prediction_variance.reshape((-1, 1))
     prediction_variance_inverse = 1. / (torch.exp(log_prediction_variance) + 1e-16)
 
     mean_squared_error = (target.view(-1, 1) - prediction_mean) ** 2
@@ -62,6 +65,7 @@ def nll(input: torch.Tensor, target: torch.Tensor):
 class Bohamiann(BaseModel):
     def __init__(self,
                  get_network=get_default_network,
+                 prior_var=1.0,
                  normalize_input: bool = True,
                  normalize_output: bool = True,
                  sampling_method: str = "adaptive_sghmc",
@@ -69,6 +73,7 @@ class Bohamiann(BaseModel):
                  metrics=(nn.MSELoss,),
                  likelihood_function=nll,
                  print_every_n_steps=100,
+                 device="cpu"
                  ) -> None:
         """
 
@@ -95,6 +100,7 @@ class Bohamiann(BaseModel):
         :param likelihood_function: function handle that computes the training loss
         :param print_every_n_steps: defines after how many the current loss is printed
         """
+        self.prior_var = prior_var
         self.print_every_n_steps = print_every_n_steps
         self.metrics = metrics
         self.do_normalize_input = normalize_input
@@ -106,21 +112,20 @@ class Bohamiann(BaseModel):
         self.sampled_weights = []  # type: typing.List[typing.Tuple[np.ndarray]]
         self.likelihood_function = likelihood_function
         self.sampler = None
+        self.device = device
 
     @property
     def network_weights(self) -> tuple:
         """
-        Extract current network weight values as `np.ndarray`.
+        Extract current network weight values
 
-        :return: Tuple containing current network weight values
+        :return: current network weight values
         """
-        return tuple(
-            np.asarray(parameter.data.clone().detach().numpy())
-            for parameter in self.model.parameters()
-        )
+        params_hmc = torch.nn.utils.parameters_to_vector(self.model.state_dict().values())
+        return params_hmc.detach()
 
     @network_weights.setter
-    def network_weights(self, weights: typing.List[np.ndarray]) -> None:
+    def network_weights(self, weights) -> None:
         """
         Assign new `weights` to our neural networks parameters.
 
@@ -129,10 +134,10 @@ class Bohamiann(BaseModel):
             the network parameters with the same index in `self.network_weights`.
         """
         logging.debug("Assigning new network weights")
-        for parameter, sample in zip(self.model.parameters(), weights):
-            parameter.copy_(torch.from_numpy(sample))
+        torch.nn.utils.vector_to_parameters(weights, self.model.parameters())
 
-    def train(self, x_train: np.ndarray, y_train: np.ndarray,
+
+    def train(self, x_train, y_train,
               num_steps: int = 13000,
               keep_every: int = 100,
               num_burn_in_steps: int = 3000,
@@ -168,23 +173,19 @@ class Bohamiann(BaseModel):
         start_time = time.time()
 
         num_datapoints, input_dimensionality = x_train.shape
+        output_dim = y_train.shape[-1]
         logging.debug(
             "Processing %d training datapoints "
             " with % dimensions each." % (num_datapoints, input_dimensionality)
         )
         assert batch_size >= 1, "Invalid batch size. Batches must contain at least a single sample."
-        assert len(y_train.shape) == 1 or (len(y_train.shape) == 2 and y_train.shape[
-            1] == 1), "Targets need to be in vector format, i.e (N,) or (N,1)"
 
         if x_train.shape[0] < batch_size:
             logging.warning("Not enough datapoints to form a batch. Use all datapoints in each batch")
             batch_size = x_train.shape[0]
 
         self.X = x_train
-        if len(y_train.shape) == 2:
-            self.y = y_train[:, 0]
-        else:
-            self.y = y_train
+        self.y = y_train
 
         if self.do_normalize_input:
             logging.debug(
@@ -192,29 +193,11 @@ class Bohamiann(BaseModel):
                 " zero mean and unit variance."
             )
             x_train_, self.x_mean, self.x_std = self.normalize_input(x_train)
-            if self.use_double_precision:
-                x_train_ = torch.from_numpy(x_train_).double()
-            else:
-                x_train_ = torch.from_numpy(x_train_).float()
-        else:
-            if self.use_double_precision:
-                x_train_ = torch.from_numpy(x_train).double()
-            else:
-                x_train_ = torch.from_numpy(x_train).float()
 
         if self.do_normalize_output:
             logging.debug("Normalizing training labels to zero mean and unit variance.")
             y_train_, self.y_mean, self.y_std = self.normalize_output(self.y)
 
-            if self.use_double_precision:
-                y_train_ = torch.from_numpy(y_train_).double()
-            else:
-                y_train_ = torch.from_numpy(y_train_).float()
-        else:
-            if self.use_double_precision:
-                y_train_ = torch.from_numpy(y_train).double()
-            else:
-                y_train_ = torch.from_numpy(y_train).float()
 
         train_loader = infinite_dataloader(
             data_utils.DataLoader(
@@ -234,9 +217,9 @@ class Bohamiann(BaseModel):
 
             self.sampled_weights.clear()
             if self.use_double_precision:
-                self.model = self.get_network(input_dimensionality=input_dimensionality).double()
+                self.model = self.get_network(input_dimensionality=input_dimensionality, output_dim=output_dim, device=self.device).double()
             else:
-                self.model = self.get_network(input_dimensionality=input_dimensionality).float()
+                self.model = self.get_network(input_dimensionality=input_dimensionality, output_dim=output_dim, device=self.device).float()
 
             if self.sampling_method == "adaptive_sghmc":
                 self.sampler = AdaptiveSGHMC(self.model.parameters(),
@@ -268,7 +251,7 @@ class Bohamiann(BaseModel):
             # in Welling and Whye The 2011. Because of that we divide here by N=num of datapoints since
             # in the sample we rescale the gradient by N again
             loss -= log_variance_prior(self.model(x_batch)[:, 1].view((-1, 1))) / num_datapoints
-            loss -= weight_prior(self.model.parameters(), dtype=dtype) / num_datapoints
+            loss -= weight_prior(self.model.parameters(), dtype=dtype, wdecay=(1.0 / self.prior_var)) / num_datapoints
             loss.backward()
             self.sampler.step()
 
@@ -277,21 +260,21 @@ class Bohamiann(BaseModel):
                 # compute the training performance of the ensemble
                 if len(self.sampled_weights) > 1:
                     mu, var = self.predict(x_train)
-                    total_nll = -np.mean(norm.logpdf(y_train, loc=mu, scale=np.sqrt(var)))
-                    total_mse = np.mean((y_train - mu) ** 2)
+                    total_nll = -torch.mean(torch.distributions.Normal(mu, torch.sqrt(var)).log_prob(y_train))
+                    total_mse = torch.mean((y_train - mu) ** 2)
                 # in case we do not have an ensemble we compute the performance of the last weight sample
                 else:
                     f = self.model(x_train_)
 
                     if self.do_normalize_output:
-                        mu = zero_mean_unit_var_denormalization(f[:, 0], self.y_mean, self.y_std).data.numpy()
-                        var = torch.exp(f[:, 1]) * self.y_std ** 2
-                        var = var.data.numpy()
+                        mu = zero_mean_unit_var_denormalization(f[..., :output_dim], self.y_mean, self.y_std)
+                        var = torch.exp(f[..., :output_dim]) * self.y_std ** 2
+                        var = var
                     else:
-                        mu = f[:, 0].data.numpy()
-                        var = np.exp(f[:, 1].data.numpy())
-                    total_nll = -np.mean(norm.logpdf(y_train, loc=mu, scale=np.sqrt(var)))
-                    total_mse = np.mean((y_train - mu) ** 2)
+                        mu = f[..., :output_dim]
+                        var = torch.exp(f[..., output_dim:])
+                    total_nll = -torch.mean(torch.distributions.Normal(mu, torch.sqrt(var)).log_prob(y_train))
+                    total_mse = torch.mean((y_train - mu) ** 2)
 
                 t = time.time() - start_time
 
@@ -404,7 +387,7 @@ class Bohamiann(BaseModel):
         """
         return zero_mean_unit_var_normalization(x, m, s)
 
-    def predict(self, x_test: np.ndarray, return_individual_predictions: bool = False):
+    def predict(self, x_test, return_individual_predictions: bool = False):
         """
         Predicts mean and variance for the given test point
 
@@ -412,30 +395,29 @@ class Bohamiann(BaseModel):
         :param return_individual_predictions: if True also the predictions of the individual models are returned
         :return: mean and variance
         """
-        x_test_ = np.asarray(x_test)
-
         if self.do_normalize_input:
-            x_test_, *_ = self.normalize_input(x_test_, self.x_mean, self.x_std)
+            x_test_, *_ = self.normalize_input(x_test, self.x_mean, self.x_std)
 
         def network_predict(x_test_, weights):
-            with torch.no_grad():
-                self.network_weights = weights
-                if self.use_double_precision:
-                    return self.model(torch.from_numpy(x_test_).double()).numpy()
-                else:
-                    return self.model(torch.from_numpy(x_test_).float()).numpy()
+            self.network_weights = weights
+            return self.model(x_test_)
+                # if self.use_double_precision:
+                #     return self.model(torch.from_numpy(x_test_).double()).numpy()
+                # else: 
+                #     return self.model(torch.from_numpy(x_test_).float()).numpy()
 
+        output_dim = int(network_predict(x_test_, weights=self.sampled_weights[0]).shape[-1] / 2)
         logging.debug("Predicting with %d networks." % len(self.sampled_weights))
-        network_outputs = np.array([
+        network_outputs = torch.stack([
             network_predict(x_test_, weights=weights)
             for weights in self.sampled_weights
         ])
 
-        mean_prediction = np.mean(network_outputs[:, :, 0], axis=0)
+        mean_prediction = torch.mean(network_outputs[..., :output_dim], axis=0)
         # variance_prediction = np.mean((network_outputs[:, :, 0] - mean_prediction) ** 2, axis=0)
         # Total variance
-        variance_prediction = np.mean((network_outputs[:, :, 0] - mean_prediction) ** 2
-                                      + np.exp(network_outputs[:, :, 1]), axis=0)
+        variance_prediction = torch.mean((network_outputs[..., :output_dim] - mean_prediction) ** 2
+                                      + torch.exp(network_outputs[..., output_dim:]), axis=0)
 
         if self.do_normalize_output:
 
@@ -445,12 +427,12 @@ class Bohamiann(BaseModel):
             variance_prediction *= self.y_std ** 2
 
             for i in range(len(network_outputs)):
-                network_outputs[i] = zero_mean_unit_var_denormalization(
-                    network_outputs[i], self.y_mean, self.y_std
+                network_outputs[i, ..., :output_dim] = zero_mean_unit_var_denormalization(
+                    network_outputs[i, ..., :output_dim], self.y_mean, self.y_std
                 )
 
         if return_individual_predictions:
-            return mean_prediction, variance_prediction, network_outputs[:, :, 0]
+            return mean_prediction, variance_prediction, network_outputs[..., :output_dim] #network_outputs[:, :, 0]
 
         return mean_prediction, variance_prediction
 
